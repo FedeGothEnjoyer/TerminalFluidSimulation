@@ -152,8 +152,12 @@ void build_line (int yb, int ye, vector<string>& buffer, int id) {
                 color pixel = FRAME_BUFFER[screen_x][screen_y*2].Clamp();
                 color pixel2 = FRAME_BUFFER[screen_x][screen_y*2+1].Clamp();
 
-                pixel = {dens(screen_x,screen_y*2),0,0};
-                pixel2 = {dens(screen_x,screen_y*2+1),0,0};
+                auto d_val = min(10.0f,dens(screen_x+1,screen_y*2+1))/10.0f;
+                pixel = {d_val,d_val,d_val};
+
+                d_val = min(10.0f,dens(screen_x+1,screen_y*2+2))/10.0f;
+                pixel2 = {d_val,d_val,d_val};
+
 
                 if(screen_x==mousePos.x&&screen_y==mousePos.y) pixel = color(1,0,0);
 
@@ -404,16 +408,26 @@ int main(){
 
         std::chrono::duration<float> curTime = delta_time_clock - start_time;
         
-        swap(prev_dens,dens);
+        //swap(prev_dens,dens);
+        fill(prev_dens.data_.begin(), prev_dens.data_.end(), 0.0f);
+        fill(prev_vel_x.data_.begin(), prev_vel_x.data_.end(), 0.0f);
+        fill(prev_vel_y.data_.begin(), prev_vel_y.data_.end(), 0.0f);
 
-        if(ch=='c'){
-            prev_dens(mousePos.x,mousePos.y*2)=1.0f;
-        }
+        //demo wind tunnel
+        prev_vel_y(105,30) = 2000.0f;
+        prev_vel_y(40,70) = -2000.0f;
+        prev_vel_y(165,70) = -2000.0f;
+        prev_vel_x(80, 80) = -1000.0f;
+        prev_vel_x(120, 80) = 1000.0f;
+        prev_vel_x(80, 20) = 1000.0f;
+        prev_vel_x(120, 20) = -1000.0f;
+
+        prev_dens(mousePos.x+1,mousePos.y*2+1)=5000.0f;
         
         //prev_vel_y(60,10) = 100.0f;
 
-        VelocityStep(vel_x,vel_y,prev_vel_x,prev_vel_y,0.01f,FIXED_DELTA_TIME);
-        DensityStep(dens, prev_dens, vel_x, vel_y, 0.01f, FIXED_DELTA_TIME);
+        VelocityStep(vel_x,vel_y,prev_vel_x,prev_vel_y,0.001f,FIXED_DELTA_TIME);
+        DensityStep(dens, prev_dens, vel_x, vel_y, 0.0001f, FIXED_DELTA_TIME);
 
 
         ////////////////////////////////////////////
@@ -428,7 +442,7 @@ int main(){
         output.clear();
 
         output += "\x1b[H\x1b[?25l";
-        output += "\x1b[39;49m" + to_string(SCREEN_WIDTH) + "x" + to_string(SCREEN_HEIGHT*2) + " fps:" + to_string(cur_fps) + " mouse: [" + to_string(mousePos.x) + ":" + to_string(mousePos.y) + "]\x1b[K\n";
+        output += "\x1b[39;49m" + to_string(SCREEN_WIDTH) + "x" + to_string(SCREEN_HEIGHT*2) + " fps:" + to_string(cur_fps) + " mouse: [" + to_string(mousePos.x) + ":" + to_string(mousePos.y) + "] (" + to_string(dens(mousePos.x,mousePos.y*2)) + ")\x1b[K\n";
 
         for(auto &s:semaphore_full) s.acquire();
 
