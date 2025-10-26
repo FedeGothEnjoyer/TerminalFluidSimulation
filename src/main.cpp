@@ -25,14 +25,18 @@ constexpr float FP_EPSILON = 1e-6f;
 constexpr int CORES = 12;
 const int threshold = 0;
 
-const int TARGET_FPS = 3000; //-1 for uncapped fps
+const int TARGET_FPS = 60; //-1 for uncapped fps
 const chrono::duration<double, std::nano> FRAME_DURATION(1000000000.0 / TARGET_FPS);
+const float FIXED_DELTA_TIME = 1.0f/TARGET_FPS;
+
+
 
 vector<vector<color>>FRAME_BUFFER;
 
 int SCREEN_WIDTH,SCREEN_HEIGHT;
 chrono::steady_clock::time_point start_time;
 chrono::steady_clock::time_point delta_time_clock;
+
 
 array<binary_semaphore,CORES>semaphore_full=[]<size_t...Is>(index_sequence<Is...>){return array<binary_semaphore,sizeof...(Is)>{((void)Is,binary_semaphore{0})...};}(make_index_sequence<CORES>());
 array<binary_semaphore,CORES>semaphore_empty=[]<size_t...Is>(index_sequence<Is...>){return array<binary_semaphore,sizeof...(Is)>{((void)Is,binary_semaphore{0})...};}(make_index_sequence<CORES>());
@@ -51,7 +55,7 @@ void RestoreTerminal() {
     std::cout << "\x1b" "c" << std::flush;
 }
 
-bool ReadInput() {
+char ReadInput() {
     constexpr int READ_BUFFER_SIZE = 128;
     char buf[READ_BUFFER_SIZE];
     
@@ -64,7 +68,7 @@ bool ReadInput() {
     
     for (ssize_t i = 0; i < nread; ++i) {
         if (buf[i] == 'c'||buf[i] == 'q') {
-            return true;
+            return buf[i];
         }
         if (i + 2 < nread && buf[i] == '\x1b' && buf[i+1] == '[' && buf[i+2] == 'M') {
             if (i + 5 < nread) {
@@ -79,16 +83,21 @@ bool ReadInput() {
 
 template <typename T>
 class Matrix {
+public:
     int size_x, size_y;
     std::vector<T> data_;
-public:
     Matrix(int cols_, int rows_)
         : size_x(cols_), size_y(rows_), data_(rows_ * cols_) {}
 
     inline T& operator()(int r, int c) noexcept {
-        return data_[r * size_x + c];
+        return data_[c * size_x + r];
     }
 };
+
+int simSizeX;
+int simSizeY;
+
+Matrix<float> dens(0,0);
 
 void getTerminalSize(int &x, int &y) {
     struct winsize w;
@@ -142,6 +151,9 @@ void build_line (int yb, int ye, vector<string>& buffer, int id) {
             for(int screen_x = 0; screen_x < sw; screen_x++){
                 color pixel = FRAME_BUFFER[screen_x][screen_y*2].Clamp();
                 color pixel2 = FRAME_BUFFER[screen_x][screen_y*2+1].Clamp();
+
+                pixel = {dens(screen_x,screen_y*2),0,0};
+                pixel2 = {dens(screen_x,screen_y*2+1),0,0};
 
                 if(screen_x==mousePos.x&&screen_y==mousePos.y) pixel = color(1,0,0);
 
@@ -213,20 +225,103 @@ void build_line (int yb, int ye, vector<string>& buffer, int id) {
 
 
 
-Matrix<glm::vec2> vel(SCREEN_WIDTH+2, SCREEN_HEIGHT*2+2);
-Matrix<glm::vec2> prev_vel(SCREEN_WIDTH+2, SCREEN_HEIGHT*2+2);
-Matrix<float> dens(SCREEN_WIDTH+2, SCREEN_HEIGHT*2+2);
-Matrix<float> prev_dens(SCREEN_WIDTH+2, SCREEN_HEIGHT*2+2);
+
 
 //       FLUID SIM FUNCTIONS
 //////////////////////////////////
 
 void AddSource(Matrix<float> &densMat, Matrix<float> &srcMat, float dTime){
-
+    for(int i = 0; i < densMat.size_x*densMat.size_y; i++) densMat.data_[i] += srcMat.data_[i]*dTime;
 }
 
+void SetBound(int b, Matrix<float> &x){
+    for (int i=1 ; i<=simSizeY ; i++ ) {
+        x(0 ,i) = b==1 ? -x(1,i) : x(1,i);
+        x(simSizeX+1,i) = b==1 ? -x(simSizeX,i) : x(simSizeX,i);
+    }
+    for(int i=1 ; i<=simSizeX ; i++ ){
+        x(i,0 ) = b==2 ? -x(i,1) : x(i,1);
+        x(i,simSizeY+1) = b==2 ? -x(i,simSizeY) : x(i,simSizeY);
+    }
+    x(0 ,0 ) = 0.5*(x(1,0 )+x(0 ,1));
+    x(0 ,simSizeY+1) = 0.5*(x(1,simSizeY+1)+x(0 ,simSizeY ));
+    x(simSizeX+1,0 ) = 0.5*(x(simSizeX,0 )+x(simSizeX+1,1));
+    x(simSizeX+1,simSizeY+1) = 0.5*(x(simSizeX,simSizeY+1)+x(simSizeX+1,simSizeY ));
+}
 
+void Diffuse(int b, Matrix<float> &densMat, Matrix<float> &prevDensMat, float diff, float dTime){
+    float a = dTime*diff*(densMat.size_x-2)*(densMat.size_y-2);
+    for(int k = 0; k < 20; k++){
+        for(int i = 1; i <= (densMat.size_x-2); i++){
+            for(int j = 1; j <= (densMat.size_y-2); j++){
+                densMat(i,j) = (prevDensMat(i,j) + a*(densMat(i-1,j)+densMat(i+1,j)+densMat(i,j-1)+densMat(i,j+1)))/(1+4*a);
+            }
+        }
+        SetBound(b, densMat);
+    }
+}
 
+void Advect(int b, Matrix<float> &densMat, Matrix<float> &prevDensMat, Matrix<float> &velMatX, Matrix<float> &velMatY, float dTime){
+    int i0, j0, i1, j1;
+    float x, y, s0, t0, s1, t1;
+    float dt0x = dTime*simSizeX;
+    float dt0y = dTime*simSizeY;
+    for(int i = 1; i <= simSizeX; i++){
+        for(int j = 1; j <= simSizeY; j++){
+            x = i-dt0x*velMatX(i,j); y = j-dt0y*velMatY(i,j);
+            if (x<0.5) x=0.5; if (x>simSizeX+0.5) x=simSizeX + 0.5; i0=(int)x; i1=i0+ 1;
+            if (y<0.5) y=0.5; if (y>simSizeY+0.5) y=simSizeY + 0.5; j0=(int)y; j1=j0+1;
+            s1 = x-i0; s0 = 1-s1; t1 = y-j0; t0 = 1-t1;
+            densMat(i,j) = s0*(t0*prevDensMat(i0,j0)+t1*prevDensMat(i0,j1))+s1*(t0*prevDensMat(i1,j0)+t1*prevDensMat(i1,j1));
+        }
+    }
+    SetBound(b, densMat);
+}
+
+void Project(Matrix<float> &velMatX,Matrix<float> &velMatY, Matrix<float> &v_p,Matrix<float> &v_div){
+    float hx = 1.0/simSizeX;
+    float hy = 1.0/simSizeY;
+    
+    for(int i = 1; i <= simSizeX; i++){
+        for(int j = 1; j <= simSizeY; j++){
+            v_div(i,j) = -0.5*hx*(velMatX(i+1,j)-velMatX(i-1,j)+velMatY(i,j+1)-velMatY(i,j-1));
+            v_p(i,j) = 0;
+        }
+    }
+    SetBound(0, v_div); SetBound(0, v_p);
+    for(int k=0; k < 20; k++){
+        for (int i=1 ; i<=simSizeX ; i++ ) {
+            for (int j=1 ; j<=simSizeY ; j++ ) {
+                v_p(i,j) = (v_div(i,j)+v_p(i-1,j)+v_p(i+1,j)+v_p(i,j-1)+v_p(i,j+1))/4;
+            }
+        }
+        SetBound(0, v_p);
+    }
+    for (int i=1 ; i<=simSizeX ; i++ ) {
+        for (int j=1 ; j<=simSizeY ; j++ ) {
+            velMatX(i,j) -= 0.5*(v_p(i+1,j)-v_p(i-1,j))/hx;
+            velMatY(i,j) -= 0.5*(v_p(i,j+1)-v_p(i,j-1))/hy;
+        }
+    }
+    SetBound(1, velMatX); SetBound(2, velMatY);
+}
+
+void DensityStep(Matrix<float> &densMat, Matrix<float> &startDensMat, Matrix<float> &velMatX, Matrix<float> &velMatY, float diff, float dTime){
+    AddSource(densMat, startDensMat, dTime);
+    swap(startDensMat, densMat); Diffuse(0, densMat, startDensMat, diff, dTime);
+    swap(startDensMat, densMat); Advect(0, densMat, startDensMat, velMatX, velMatY, dTime);
+}
+
+void VelocityStep(Matrix<float> &velMatX, Matrix<float> &velMatY, Matrix<float> &startVelMatX, Matrix<float> &startVelMatY, float visc, float dTime){
+    AddSource(velMatX, startVelMatX, dTime); AddSource(velMatY, startVelMatY, dTime);
+    swap(startVelMatX, velMatX); Diffuse(1, velMatX, startVelMatX, visc, dTime);
+    swap(startVelMatY, velMatY); Diffuse(2, velMatY, startVelMatY, visc, dTime);
+    Project(velMatX, velMatY, startVelMatX, startVelMatY);
+    swap(startVelMatX, velMatX); swap(startVelMatY, velMatY);
+    Advect(1, velMatX, startVelMatX, startVelMatX, startVelMatY, dTime);
+    Advect(2, velMatY, startVelMatY, startVelMatX, startVelMatY, dTime);
+    Project(velMatX, velMatY, startVelMatX, startVelMatY);
+}
 
 //////////////////////////////////
 
@@ -267,7 +362,15 @@ int main(){
 
     //         AREA CAZZEGGIO
     ////////////////////////////////
+    simSizeX = SCREEN_WIDTH;
+    simSizeY = SCREEN_HEIGHT*2;
 
+    Matrix<float> vel_x(simSizeX+2, simSizeY+2);
+    Matrix<float> vel_y(simSizeX+2, simSizeY+2);
+    Matrix<float> prev_vel_x(simSizeX+2, simSizeY+2);
+    Matrix<float> prev_vel_y(simSizeX+2, simSizeY+2);
+    dens = Matrix<float>(simSizeX+2, simSizeY+2);
+    Matrix<float> prev_dens(simSizeX+2, simSizeY+2);
     
 
     ////////////////////////////////
@@ -290,7 +393,8 @@ int main(){
         //            INPUT
         ////////////////////////////////////////////
 
-        if(ReadInput()){
+        char ch = ReadInput();
+        if(ch=='q'){
             RestoreTerminal();
             return 0;
         }
@@ -300,6 +404,17 @@ int main(){
 
         std::chrono::duration<float> curTime = delta_time_clock - start_time;
         
+        swap(prev_dens,dens);
+
+        if(ch=='c'){
+            prev_dens(mousePos.x,mousePos.y*2)=1.0f;
+        }
+        
+        //prev_vel_y(60,10) = 100.0f;
+
+        VelocityStep(vel_x,vel_y,prev_vel_x,prev_vel_y,0.01f,FIXED_DELTA_TIME);
+        DensityStep(dens, prev_dens, vel_x, vel_y, 0.01f, FIXED_DELTA_TIME);
+
 
         ////////////////////////////////////////////
         //           RENDERING
